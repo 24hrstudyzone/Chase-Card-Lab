@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
 :root {
   --black:#000000;--space:#050508;--surface-1:#0D0F1A;--surface-2:#131520;--surface-3:#1A1D2E;
@@ -317,6 +318,20 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--black);color:va
 /* Session warning */
 .session-warning{background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.25);border-radius:8px;padding:12px 16px;font-size:11px;color:var(--sam-orange);margin-bottom:16px}
 
+/* Live indicator */
+.live-badge{display:inline-flex;align-items:center;gap:6px;font-size:9px;font-weight:600;letter-spacing:.14em;color:var(--green);text-transform:uppercase;margin-left:12px;vertical-align:middle}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:live-pulse 1.8s ease-in-out infinite}
+@keyframes live-pulse{0%,100%{box-shadow:0 0 0 0 rgba(111,207,151,.6)}50%{box-shadow:0 0 0 5px rgba(111,207,151,0)}}
+.db-status{font-size:10px;color:var(--text-muted);text-align:center;margin-bottom:16px;letter-spacing:.06em}
+.db-status.connected{color:var(--green)}
+.db-status.error{color:var(--red)}
+
+/* Pit loading */
+.pit-loading{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;gap:16px;padding:80px 40px}
+.pit-spinner{width:36px;height:36px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pit-loading-txt{font-size:13px;color:var(--text-muted);letter-spacing:.1em;font-style:italic;font-family:'Cormorant Garamond',serif}
+
 /* Responsive */
 @media(max-width:960px){
   .lab-cols{grid-template-columns:1fr}
@@ -577,8 +592,9 @@ body{font-family:'DM Sans',system-ui,sans-serif;background:var(--black);color:va
 <section id="pit" class="section">
   <div class="pit-inner">
     <div class="pit-hdr">
-      <div class="pit-title">THE PIT</div>
+      <div class="pit-title">THE PIT<span class="live-badge" id="live-badge" style="display:none"><span class="live-dot"></span>Live</span></div>
       <div class="pit-sub">Every card ever forged. Compare. Compete.</div>
+      <div class="db-status" id="db-status"></div>
     </div>
     <div id="session-warning" class="session-warning" style="display:none">
       Storage unavailable — cards will persist for this session only.
@@ -765,18 +781,94 @@ const state = {
   storageAvailable: false
 };
 
-// ======================== STORAGE ========================
-function checkStorage() {
-  try { localStorage.setItem('__test','1'); localStorage.removeItem('__test'); state.storageAvailable = true; }
-  catch(e) { state.storageAvailable = false; document.getElementById('session-warning').style.display='block'; }
+// ======================== SUPABASE ========================
+const SUPABASE_URL = 'https://tkundwwsjobqyaozhlzf.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRrdW5kd3dzam9icXlhb3pobHpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4MjY1ODIsImV4cCI6MjA5NTQwMjU4Mn0.PyFXW6IrGt9unMZRhPw4UUrC7y40WC3C79M_8yuwqvA';
+let db = null;
+
+function initSupabase() {
+  try {
+    db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    return true;
+  } catch(e) { console.error('Supabase init failed:', e); return false; }
 }
-function loadCards() {
-  if (!state.storageAvailable) return;
-  try { const d = localStorage.getItem('cardlab_pit'); if(d) state.savedCards = JSON.parse(d); } catch(e){}
+
+function mapDbCard(row) {
+  return {
+    id: row.id,
+    timestamp: row.created_at,
+    cardName: row.card_name,
+    segKey: row.seg_key,
+    annualFee: row.annual_fee,
+    grad: row.grad || 'linear-gradient(135deg,#0A1628,#1A4A8F,#0D1F3C)',
+    fitScore: row.fit_score,
+    result: row.result || { totalNetCostM: row.total_net_cost_m },
+    selections: row.selections || {}
+  };
 }
-function persistCards() {
-  if (!state.storageAvailable) return;
-  try { localStorage.setItem('cardlab_pit', JSON.stringify(state.savedCards)); } catch(e){}
+
+function setDbStatus(msg, type='') {
+  const el = document.getElementById('db-status');
+  const badge = document.getElementById('live-badge');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'db-status' + (type ? ' '+type : '');
+  if (badge) badge.style.display = type === 'connected' ? 'inline-flex' : 'none';
+}
+
+async function loadCards() {
+  if (!db) {
+    // Fallback: localStorage
+    try { const d=localStorage.getItem('cardlab_pit'); if(d) state.savedCards=JSON.parse(d); } catch(e){}
+    return;
+  }
+  try {
+    const { data, error } = await db.from('pit_cards').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+    state.savedCards = data.map(mapDbCard);
+    setDbStatus('● Connected to shared database', 'connected');
+  } catch(e) {
+    console.error('loadCards error:', e);
+    setDbStatus('Database unavailable — showing local cards only', 'error');
+    try { const d=localStorage.getItem('cardlab_pit'); if(d) state.savedCards=JSON.parse(d); } catch(_){}
+  }
+}
+
+async function insertCard(card) {
+  if (!db) { persistLocal(card); return; }
+  try {
+    const { error } = await db.from('pit_cards').insert({
+      card_name:       card.cardName,
+      seg_key:         card.segKey,
+      annual_fee:      card.annualFee,
+      grad:            card.grad,
+      fit_score:       card.fitScore,
+      total_net_cost_m:card.result.totalNetCostM,
+      selections:      card.selections,
+      result:          card.result
+    });
+    if (error) throw error;
+  } catch(e) {
+    console.error('insertCard error:', e);
+    persistLocal(card);
+  }
+}
+
+function persistLocal(card) {
+  card.id = card.id || Date.now();
+  card.timestamp = card.timestamp || new Date().toISOString();
+  state.savedCards.unshift(card);
+  try { localStorage.setItem('cardlab_pit', JSON.stringify(state.savedCards)); } catch(_){}
+}
+
+function setupRealtime() {
+  if (!db) return;
+  db.channel('pit_cards_changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'pit_cards' }, async () => {
+      await loadCards();
+      if (document.getElementById('pit').classList.contains('active')) renderPit();
+    })
+    .subscribe();
 }
 
 // ======================== CALCULATIONS ========================
@@ -1152,13 +1244,17 @@ function startLab() {
   updateProgress();
 }
 
-function showPit() {
+async function showPit() {
   document.getElementById('hero').style.display='none';
   ['lab','result'].forEach(id => { const el=document.getElementById(id); if(el){el.style.display='none';el.classList.remove('active');} });
   document.getElementById('pit').style.display='block';
   document.getElementById('pit').classList.add('active');
+  window.scrollTo(0,0);
+  // Show spinner while loading from db
+  const grid = document.getElementById('pit-grid');
+  if (grid) grid.innerHTML = '<div class="pit-loading"><div class="pit-spinner"></div><div class="pit-loading-txt">Loading cards from the shared Pit...</div></div>';
+  await loadCards();
   renderPit();
-  // Check admin
   if (location.search.includes('admin') || location.hash.includes('admin')) {
     document.getElementById('admin-panel').classList.add('visible');
     renderAdmin();
@@ -1483,14 +1579,12 @@ function fmtPeople(n) {
 }
 
 // ======================== SAVE TO THE PIT ========================
-function saveToPit() {
+async function saveToPit() {
   const seg=state.selections.segment;
   const fee=state.selections.bonusFee;
   if(!seg||!fee) return;
   const r=calcResult(seg.segKey, fee.annualFee);
   const card={
-    id: Date.now(),
-    timestamp: new Date().toISOString(),
     cardName: getCardName(),
     segKey: seg.segKey,
     annualFee: fee.annualFee,
@@ -1509,8 +1603,7 @@ function saveToPit() {
     fitScore: getFitScore(),
     grad: getCardGrad()
   };
-  state.savedCards.unshift(card);
-  persistCards();
+  await insertCard(card);
   showPit();
 }
 
@@ -1639,11 +1732,14 @@ function exportCSV() {
   a.click();
 }
 
-function clearAllCards() {
-  if(!confirm('Delete all saved cards from The Pit? This cannot be undone.')) return;
+async function clearAllCards() {
+  if(!confirm('Delete ALL cards from the shared Pit? This affects every user. This cannot be undone.')) return;
+  if (db) {
+    try { await db.from('pit_cards').delete().gte('id', 0); } catch(e) { console.error(e); }
+  }
   state.savedCards=[];
   state.compareList=[];
-  persistCards();
+  try { localStorage.removeItem('cardlab_pit'); } catch(_){}
   renderPit();
   updateCompareBar();
   renderAdmin();
@@ -1685,8 +1781,8 @@ Estimates only. Not investment-grade projections.`;
 
 // ======================== INIT ========================
 function init() {
-  checkStorage();
-  loadCards();
+  initSupabase();
+  setupRealtime();
   startHeroAnimation();
 
   // Close modal on backdrop click
